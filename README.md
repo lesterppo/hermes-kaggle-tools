@@ -18,9 +18,10 @@ cd hermes-kaggle-tools
 |------|---------|
 | `kg.py` | Main CLI — 20 commands for notebook lifecycle management |
 | `oauth_login.py` | One-time OAuth authentication helper |
-| `medgemma_deploy.py` | Deploy template for GGUF models on Kaggle GPU |
+| `medgemma_deploy.py` | Deploy template for GGUF models on Kaggle GPU (with vision) |
+| `medgemma` | Chat CLI for deployed LLMs — text + image analysis |
 | `SKILL.md` | AI agent skill — load this in Hermes for guided workflows |
-| `AGENTS.md` | AI coding agent guide — design patterns, API internals |
+| `AGENTS.md` | AI coding agent guide — design patterns, API internals, vision setup |
 
 ## Commands
 
@@ -37,6 +38,17 @@ kg.py url owner/slug             # Discover tunnel API URL
 kg.py health owner/slug          # Probe tunnel API health
 kg.py output owner/slug          # Download output files
 kg.py quota                      # Check GPU quota
+```
+
+### Chat with Deployed Model
+
+```bash
+medgemma chat                     # Interactive multimodal chat
+medgemma ask "medical question"   # Single question
+medgemma view xray.jpg            # Analyze medical image
+medgemma view image.jpg "query"   # Image with specific question
+medgemma health                   # Check API (text + vision probe)
+medgemma save-url URL             # Persist API URL
 ```
 
 All commands output JSON on stdout: `{"ok": true, "summary": "..."}`. Large outputs (logs, files) go to `~/.hermes/kaggle_output/`.

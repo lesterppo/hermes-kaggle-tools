@@ -114,6 +114,46 @@ The CLI is framework-agnostic. Any agent that can execute shell commands and par
 4. Run: `kg.py run owner/slug --gpu --wait`
 5. Monitor: `kg.py sessions`
 
+## GGUF Model Deployment (Multimodal)
+
+The `medgemma_deploy.py` script is a template for deploying any GGUF model on Kaggle GPU with a Cloudflare tunnel. It handles:
+
+1. Installing llama-cpp-python with CUDA
+2. Downloading model GGUF + mmproj (vision projector)
+3. Starting OpenAI-compatible server
+4. Setting up Cloudflare tunnel
+5. Keep-alive loop (Kaggle kills children on parent exit)
+
+### Vision / Multimodal Setup
+
+**Critical flags:**
+- `--clip_model_path <mmproj.gguf>` — NOT `--mmproj` (removed in newer versions)
+- Do NOT set `--chat_format` — let server auto-detect model's built-in template
+- Setting `--chat_format gemma` BREAKS Gemma 3 image processing
+
+**MedGemma prompt engineering:**
+- "medical" triggers refusal → use "radiograph", "X-ray", "scan"
+- "findings" triggers refusal → rewrite to "observations"
+- Proven activation: `"This is a radiograph. Describe all visible structures, their positions, shapes, and densities."`
+- Always prepend this template; append user question as focus
+
+### Chat CLI (`medgemma`)
+
+The `medgemma` CLI provides interactive chat with any OpenAI-compatible endpoint:
+```
+medgemma chat              Interactive multimodal chat
+medgemma ask "question"    Single question
+medgemma view image.jpg    Analyze medical image
+medgemma health            Check API (text + vision probe)
+medgemma save-url URL      Persist API URL
+```
+
+Image analysis automatically handles:
+- Base64 encoding with MIME detection (jpg/png/gif/webm/bmp/dcm)
+- Trigger word rewriting (findings→observations, abnormality→characteristic)
+- Activation template prepending for reliable vision engagement
+- Prompt padding for ultra-short prompts (<15 chars dropped by llama.cpp)
+
 ## Extending
 
 To add a new command:
