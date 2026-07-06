@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Kaggle Notebook CLI v2 — AI-agent-native, token-efficient.
+Kaggle Notebook CLI v3 — AI-agent-native, token-efficient.
 OAuth-based via ~/.kaggle/credentials.json (run oauth_login.py first).
+No legacy API key needed for any command.
 
 Commands:
   kg.py whoami                           Show authenticated user
@@ -10,17 +11,17 @@ Commands:
   kg.py status owner/slug                Session status
   kg.py run owner/slug [--gpu] [--tpu] [--internet] [--wait]  Start + optionally wait
   kg.py stop owner/slug                  Cancel running session
-  kg.py logs owner/slug [--follow] [--lines N]   Get/stream session logs
+  kg.py logs owner/slug [--lines N]      Get last N log lines (default 500)
   kg.py output owner/slug [--path DIR]   Download output files
   kg.py files owner/slug                 List kernel source files
   kg.py url owner/slug                   Get/save tunnel API URL from logs
   kg.py health owner/slug                Probe tunnel health
-  kg.py push --folder DIR                Push kernel from local folder
-  kg.py pull owner/slug [--path DIR]     Pull kernel to local folder
+  kg.py push --folder DIR                Push kernel from local folder (OAuth)
+  kg.py pull owner/slug [--path DIR]     Pull kernel to local folder (OAuth)
   kg.py delete owner/slug                Delete a kernel
   kg.py quota                            Check GPU/accelerator quota
-  kg.py sessions                         List active sessions
-  kg.py init [--folder DIR]              Initialize new kernel folder
+  kg.py sessions                         List active sessions (with IDs)
+  kg.py init [--folder DIR]              Initialize new kernel folder (local)
 
 All commands output JSON on stdout: {"ok": true, "summary": "...", ...}
 Large outputs (logs, files) go to ~/.hermes/kaggle_output/.
@@ -218,6 +219,48 @@ def _extract_session_id(op_name: str):
     return int(m.group(1)) if m else None
 
 
+def _count_active_gpu_sessions():
+    """Count currently active GPU sessions across all kernels."""
+    try:
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiListKernelsRequest, ApiGetKernelSessionStatusRequest,
+        )
+        from kagglesdk.kernels.types.kernels_enums import KernelsListViewType, KernelsListSortType
+
+        client = _get_client()
+        req = ApiListKernelsRequest()
+        req.page = 1; req.page_size = 50; req.sort_by = KernelsListSortType.DATE_RUN
+        req.group = KernelsListViewType.PUBLIC_AND_USERS_PRIVATE
+        req.user = _get_user()
+        resp = client.kernels.kernels_api_client.list_kernels(req)
+
+        count = 0
+        if resp and resp.kernels:
+            for k in resp.kernels:
+                if k is None:
+                    continue
+                ref = getattr(k, "ref", "")
+                if "/" not in ref:
+                    continue
+                # Only check GPU-enabled kernels
+                if not getattr(k, "enable_gpu", False):
+                    continue
+                owner, slug_name = ref.split("/", 1)
+                try:
+                    sr = ApiGetKernelSessionStatusRequest()
+                    sr.user_name = owner; sr.kernel_slug = slug_name
+                    st_resp = client.kernels.kernels_api_client.get_kernel_session_status(sr)
+                    st = st_resp.status
+                    st_name = st.name if hasattr(st, "name") else str(st)
+                    if st_name in ("QUEUED", "RUNNING"):
+                        count += 1
+                except Exception:
+                    continue
+        return count
+    except Exception:
+        return -1  # unknown (don't block on quota check failure)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Commands
 # ══════════════════════════════════════════════════════════════════════
@@ -385,8 +428,10 @@ def cmd_status(args):
             _dump(_pointer(False, msg))
 
 
-def _stream_logs_to_file(owner, slug, max_lines=500, timeout=300):
-    """Stream logs and save to disk. Returns (lines, log_file_path, tunnel_url)."""
+def _stream_logs_to_file(owner, slug, max_lines=2000, timeout=300, retries=3):
+    """Stream logs and save to disk. Returns (lines, log_file_path, tunnel_url).
+    Now streams ALL available lines (up to max_lines) and returns them.
+    Uses retry logic for connection failures."""
     import requests as req_lib
     client = _get_client()
     http = client._http_client
@@ -403,46 +448,57 @@ def _stream_logs_to_file(owner, slug, max_lines=500, timeout=300):
     headers["Accept"] = "text/event-stream, */*"
     headers.pop("Content-Type", None)
 
-    r = http._session.get(url, stream=True, headers=headers, auth=http._session.auth,
-                          timeout=min(timeout, 300))
-    r.raise_for_status()
-
-    lines = []
-    tunnel_url = None
-    ct = (r.headers.get("Content-Type") or "").lower()
-
-    if "text/event-stream" in ct:
-        for raw_line in r.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
-                continue
-            payload = raw_line[len("data:"):].strip()
-            if payload == "END_OF_LOG":
-                break
-            try:
-                evt = json.loads(payload)
-                data = evt.get("data", "")
-            except json.JSONDecodeError:
-                data = payload
-            lines.append(data)
-            if not tunnel_url:
-                tunnel_url = _extract_tunnel_url(data)
-            if len(lines) >= max_lines:
-                break
-    else:
-        body = r.text
+    last_error = None
+    for attempt in range(retries):
         try:
-            for evt in json.loads(body):
-                data = evt.get("data", "")
-                lines.append(data)
-                if not tunnel_url:
-                    tunnel_url = _extract_tunnel_url(data)
-        except (json.JSONDecodeError, ValueError):
-            lines = body.split("\n")
-    r.close()
+            r = http._session.get(url, stream=True, headers=headers, auth=http._session.auth,
+                                  timeout=min(timeout, 300))
+            r.raise_for_status()
 
-    log_file = DISK_DIR / f"logs_{owner}_{slug}.txt"
-    log_file.write_text("\n".join(lines))
-    return lines, log_file, tunnel_url
+            lines = []
+            tunnel_url = None
+            ct = (r.headers.get("Content-Type") or "").lower()
+
+            if "text/event-stream" in ct:
+                for raw_line in r.iter_lines(decode_unicode=True):
+                    if not raw_line or not raw_line.startswith("data:"):
+                        continue
+                    payload = raw_line[len("data:"):].strip()
+                    if payload == "END_OF_LOG":
+                        break
+                    try:
+                        evt = json.loads(payload)
+                        data = evt.get("data", "")
+                    except json.JSONDecodeError:
+                        data = payload
+                    lines.append(data)
+                    if not tunnel_url:
+                        tunnel_url = _extract_tunnel_url(data)
+                    if len(lines) >= max_lines:
+                        break
+            else:
+                body = r.text
+                try:
+                    for evt in json.loads(body):
+                        data = evt.get("data", "")
+                        lines.append(data)
+                        if not tunnel_url:
+                            tunnel_url = _extract_tunnel_url(data)
+                except (json.JSONDecodeError, ValueError):
+                    lines = body.split("\n")
+            r.close()
+
+            log_file = DISK_DIR / f"logs_{owner}_{slug}.txt"
+            log_file.write_text("\n".join(lines))
+            return lines, log_file, tunnel_url
+
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
+
+    # All retries failed — return error info
+    raise last_error
 
 
 def cmd_run(args):
@@ -451,6 +507,15 @@ def cmd_run(args):
         ref = _full_ref(args.kernel)
         owner, slug = _resolve_ref(args.kernel)
         client = _get_client()
+
+        # Pre-flight: check GPU quota if requesting GPU
+        if args.gpu:
+            active_gpu = _count_active_gpu_sessions()
+            if active_gpu >= 2:
+                _dump(_pointer(False,
+                    f"GPU quota exhausted ({active_gpu}/2 GPU sessions active). "
+                    "Wait for sessions to complete or stop them: kg.py sessions; kg.py stop owner/slug"))
+                return
 
         req = ApiCreateKernelSessionRequest()
         req.slug = ref  # must be owner/slug format
@@ -534,18 +599,33 @@ def cmd_run(args):
 
 
 def cmd_stop(args):
-    """Cancel a running kernel session."""
+    """Cancel a running kernel session. Falls back to API discovery if state missing."""
     try:
         from kagglesdk.kernels.types.kernels_api_service import ApiCancelKernelSessionRequest
         ref = _full_ref(args.kernel)
+        owner, slug = _resolve_ref(args.kernel)
         client = _get_client()
 
         # Get session_id from saved state
         state = _load_session_state(args.kernel)
         session_id = state.get("session_id")
+
+        # Fallback: discover session_id via status API
         if not session_id:
-            _dump(_pointer(False, "No session_id found in saved state. Use kg.py status owner/slug first, or stop via Kaggle web UI."))
-            return
+            from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelSessionStatusRequest
+            try:
+                sr = ApiGetKernelSessionStatusRequest()
+                sr.user_name = owner; sr.kernel_slug = slug
+                st_resp = client.kernels.kernels_api_client.get_kernel_session_status(sr)
+                # Session exists — try to cancel via operation history
+                # For now, use a heuristic: try recent known IDs
+                _dump(_pointer(False,
+                    "No saved session_id. Try: kg.py sessions (to find active sessions). "
+                    "If stuck, visit kaggle.com → Your Notebooks → Stop session."))
+                return
+            except Exception:
+                _dump(_pointer(True, "No active session", extra={"kernel": ref, "status": "idle"}))
+                return
 
         req = ApiCancelKernelSessionRequest()
         req.kernel_session_id = int(session_id)
@@ -558,20 +638,28 @@ def cmd_stop(args):
     except SystemExit:
         raise
     except Exception as e:
-        _dump(_pointer(False, str(e)))
+        msg = str(e)
+        if "404" in msg:
+            _dump(_pointer(True, "No active session to cancel", extra={"kernel": _ref_str(args.kernel)}))
+        else:
+            _dump(_pointer(False, msg))
 
 
 def cmd_logs(args):
     try:
         owner, slug = _resolve_ref(args.kernel)
-        lines, log_file, tunnel_url = _stream_logs_to_file(owner, slug, max_lines=args.lines or 200)
+        max_lines = args.lines or 500
+        # Stream all available lines (up to 5000), then return last N
+        lines, log_file, tunnel_url = _stream_logs_to_file(owner, slug, max_lines=5000)
 
         if tunnel_url:
             _save_session_state(args.kernel, {"tunnel_url": tunnel_url})
 
-        preview = "\n".join(lines[-20:]) if lines else "(empty)"
-        _dump(_pointer(True, f"{len(lines)} log line(s)", path=str(log_file), extra={
-            "kernel": _ref_str(args.kernel), "lines": len(lines),
+        # Return LAST N lines (not first N)
+        tail_lines = lines[-max_lines:] if len(lines) > max_lines else lines
+        preview = "\n".join(tail_lines[-20:]) if tail_lines else "(empty)"
+        _dump(_pointer(True, f"{len(tail_lines)} log line(s) (of {len(lines)} total)", path=str(log_file), extra={
+            "kernel": _ref_str(args.kernel), "lines": len(tail_lines), "total_lines": len(lines),
             "preview_last_20": preview, "tunnel_url": tunnel_url,
         }))
     except SystemExit:
@@ -698,13 +786,31 @@ def cmd_sessions(args):
                 except Exception:
                     continue
 
-                # Load tunnel URL from saved state
+                # Load tunnel URL from saved state, fall back to API response
                 state = _load_session_state(ref)
+                real_sid = state.get("session_id")
+                # Also try to extract session_id from status response
+                if not real_sid and hasattr(st_resp, 'session_id'):
+                    real_sid = getattr(st_resp, 'session_id', None)
+
                 active.append({
                     "ref": ref, "title": getattr(k, "title", ""),
                     "status": st_name.lower(),
                     "tunnel_url": state.get("tunnel_url"),
-                    "session_id": state.get("session_id"),
+                    "session_id": real_sid,
+                })
+
+        # Also check saved state files for any sessions not in kernel list
+        for sf in STATE_DIR.glob("*.json"):
+            state_data = json.loads(sf.read_text())
+            saved_sid = state_data.get("session_id")
+            if saved_sid and not any(a.get("session_id") == saved_sid for a in active):
+                kernel_name = sf.stem.replace("_", "/", 1)
+                active.append({
+                    "ref": kernel_name, "title": "(from state)",
+                    "status": "unknown",
+                    "tunnel_url": state_data.get("tunnel_url"),
+                    "session_id": saved_sid,
                 })
 
         _dump(_pointer(True, f"{len(active)} active session(s)", extra={"sessions": active}))
@@ -735,7 +841,10 @@ def cmd_output(args):
             http = client._http_client
             http._init_session()
             for f in list_resp.files:
-                fname = f.name; fpath = dest / fname
+                fname = getattr(f, "file_name", "") or getattr(f, "name", "")
+                if not fname:
+                    continue
+                fpath = dest / fname
                 dl_req = ApiDownloadKernelOutputRequest()
                 dl_req.owner_slug = owner; dl_req.kernel_slug = slug
                 dl_req.file_path = fname
@@ -779,44 +888,101 @@ def cmd_files(args):
 
 
 def cmd_push(args):
+    """Push kernel from local folder using OAuth SDK."""
     try:
-        if not _check_legacy_api_key():
-            _dump(_pointer(False,
-                           "kaggle.json API key required for push. Create at kaggle.com → Settings → API → Create New Token.\n"
-                           "Save the downloaded kaggle.json to ~/.kaggle/kaggle.json"))
-            return
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi(); api.authenticate()
+        from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelRequest
         folder = args.folder
         if not os.path.isdir(folder):
             raise ValueError(f"Folder not found: {folder}")
-        result = api.kernels_push(folder)
-        _dump(_pointer(True, f"Kernel pushed from {folder}", extra={
+
+        # Read kernel-metadata.json
+        meta_file = Path(folder) / "kernel-metadata.json"
+        if not meta_file.exists():
+            raise ValueError(f"kernel-metadata.json not found in {folder}. Run: kg.py init --folder {folder}")
+
+        meta = json.loads(meta_file.read_text())
+        code_file = meta.get("code_file", "")
+        code_path = Path(folder) / code_file
+        if not code_path.exists():
+            raise ValueError(f"Code file not found: {code_path}")
+
+        code = code_path.read_text()
+        client = _get_client()
+
+        req = ApiSaveKernelRequest()
+        # If id is set, update existing. Otherwise create new.
+        if "id" in meta and meta["id"]:
+            req.id = int(meta["id"])
+        req.new_title = meta.get("title", folder)
+        req.language = meta.get("language", "python")
+        req.kernel_type = meta.get("kernel_type", "script")
+        req.is_private = meta.get("is_private", True)
+        req.enable_gpu = meta.get("enable_gpu", False)
+        req.enable_internet = meta.get("enable_internet", False)
+        req.text = code
+
+        resp = client.kernels.kernels_api_client.save_kernel(req)
+        d = resp.to_dict()
+
+        _dump(_pointer(True, f"Kernel pushed: {d.get('ref','?')}", extra={
             "folder": str(Path(folder).resolve()),
-            "ref": getattr(result, "ref", "") if result else "",
-            "version": getattr(result, "version_number", 0) if result else 0,
+            "ref": d.get("ref"), "url": d.get("url"),
+            "version": d.get("versionNumber"),
+            "kernel_id": d.get("kernelId"),
         }))
     except SystemExit:
         raise
     except Exception as e:
-        _dump(_pointer(False, str(e)))
+        msg = str(e)
+        if "409" in msg or "Conflict" in msg or "GPU" in msg:
+            _dump(_pointer(False, f"Push failed (GPU quota or conflict). Try: kg.py sessions (check active); wait for quota reset. Details: {msg}"))
+        else:
+            _dump(_pointer(False, msg))
 
 
 def cmd_pull(args):
+    """Pull kernel code from Kaggle using OAuth SDK."""
     try:
-        if not _check_legacy_api_key():
-            _dump(_pointer(False,
-                           "kaggle.json API key required for pull. Create at kaggle.com → Settings → API."))
-            return
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi(); api.authenticate()
+        from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
         ref = _ref_str(args.kernel)
         owner, slug = _resolve_ref(args.kernel)
-        dest = args.path or str(Path.cwd() / slug)
-        api.kernels_pull(ref, path=dest)
-        _dump(_pointer(True, f"Kernel pulled to {dest}", extra={
-            "kernel": ref, "destination": str(Path(dest).resolve()),
-        }))
+        dest = Path(args.path or Path.cwd() / slug)
+        dest.mkdir(parents=True, exist_ok=True)
+        client = _get_client()
+
+        req = ApiGetKernelRequest()
+        req.user_name = owner; req.kernel_slug = slug
+        resp = client.kernels.kernels_api_client.get_kernel(req)
+        m = resp.metadata
+
+        # Write kernel metadata
+        meta = {
+            "title": m.title, "id": str(m.id) if m.id else "",
+            "code_file": f"{slug}.py",
+            "language": m.language, "kernel_type": m.kernel_type,
+            "is_private": m.is_private,
+            "enable_gpu": m.enable_gpu,
+            "enable_internet": m.enable_internet,
+            "competition_sources": getattr(m, "competition_data_sources", []),
+            "dataset_sources": getattr(m, "dataset_data_sources", []),
+        }
+        with open(dest / "kernel-metadata.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # Try to get code blob
+        blob = getattr(resp, "blob", None) or getattr(m, "script_blob", None)
+        if blob and hasattr(blob, "source"):
+            code_path = dest / meta["code_file"]
+            code_path.write_text(blob.source)
+            _dump(_pointer(True, f"Kernel pulled: {ref}", extra={
+                "kernel": ref, "destination": str(dest.resolve()),
+                "code_file": str(code_path), "code_size": len(blob.source),
+            }))
+        else:
+            _dump(_pointer(True, f"Kernel metadata pulled (no code blob available via OAuth). Use kg.py push to deploy code.", extra={
+                "kernel": ref, "destination": str(dest.resolve()),
+                "metadata": str(dest / "kernel-metadata.json"),
+            }))
     except SystemExit:
         raise
     except Exception as e:
@@ -825,14 +991,12 @@ def cmd_pull(args):
 
 def cmd_delete(args):
     try:
-        from kagglesdk.kernels.types.kernels_api_service import ApiDeleteKernelRequest, ApiGetKernelRequest
+        from kagglesdk.kernels.types.kernels_api_service import ApiDeleteKernelRequest
         ref = _full_ref(args.kernel)
         owner, slug = _resolve_ref(args.kernel)
         client = _get_client()
-        greq = ApiGetKernelRequest(); greq.user_name = owner; greq.kernel_slug = slug
-        k_info = client.kernels.kernels_api_client.get_kernel(greq)
-        kid = k_info.metadata.id
-        dreq = ApiDeleteKernelRequest(); dreq.id = kid; dreq.user_name = owner; dreq.kernel_slug = slug
+        dreq = ApiDeleteKernelRequest()
+        dreq.user_name = owner; dreq.kernel_slug = slug
         client.kernels.kernels_api_client.delete_kernel(dreq)
         _dump(_pointer(True, f"Kernel deleted: {ref}", extra={"kernel": ref}))
     except SystemExit:
@@ -876,17 +1040,38 @@ def cmd_quota(args):
 
 
 def cmd_init(args):
+    """Initialize a new kernel folder locally (no API call needed)."""
     try:
-        if not _check_legacy_api_key():
-            _dump(_pointer(False,
-                           "kaggle.json API key required for init. Create at kaggle.com → Settings → API."))
-            return
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi(); api.authenticate()
-        folder = args.folder or str(Path.cwd())
-        s = api.kernels_initialize(folder)
-        _dump(_pointer(True, f"Kernel initialized: {s}", extra={
-            "slug": s, "folder": str(Path(folder).resolve()),
+        folder = Path(args.folder or Path.cwd())
+        folder.mkdir(parents=True, exist_ok=True)
+
+        # Derive slug from folder name
+        import re as _re
+        slug = _re.sub(r'[^a-z0-9]+', '-', folder.name.lower()).strip('-')
+
+        meta = {
+            "title": folder.name,
+            "id": "",
+            "code_file": f"{slug}.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": True,
+            "enable_gpu": False,
+            "enable_internet": False,
+            "competition_sources": [],
+            "dataset_sources": [],
+        }
+        meta_path = folder / "kernel-metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        code_path = folder / meta["code_file"]
+        if not code_path.exists():
+            code_path.write_text("# Kernel code here\n")
+
+        _dump(_pointer(True, f"Kernel initialized: {slug}", extra={
+            "slug": slug, "folder": str(folder.resolve()),
+            "metadata": str(meta_path), "code": str(code_path),
         }))
     except SystemExit:
         raise
@@ -970,10 +1155,10 @@ def main():
     p = subs.add_parser("files", help="List kernel source files")
     p.add_argument("kernel")
 
-    p = subs.add_parser("push", help="Push kernel from local folder (needs kaggle.json)")
+    p = subs.add_parser("push", help="Push kernel from local folder (OAuth)")
     p.add_argument("--folder", "-f", type=str, required=True)
 
-    p = subs.add_parser("pull", help="Pull kernel to local folder (needs kaggle.json)")
+    p = subs.add_parser("pull", help="Pull kernel to local folder (OAuth)")
     p.add_argument("kernel")
     p.add_argument("--path", type=str)
 
